@@ -1,0 +1,47 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.arikusi/deepseek",
+  "description": "MCP server for DeepSeek AI with chat, reasoning, sessions, function calling, and cost tracking",
+  "repository": {
+    "url": "https://github.com/arikusi/deepseek-mcp-server",
+    "source": "github"
+  },
+  "version": "2.2.0",
+  "websiteUrl": "https://mcp.tahirl.com",
+  "icon": "https://raw.githubusercontent.com/arikusi/deepseek-mcp-server/main/icon.png",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@arikusi/deepseek-mcp-server",
+      "version": "2.2.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "DEEPSEEK_API_KEY",
+          "description": "DeepSeek API key",
+          "isRequired": true,
+          "isSecret": true
+        }
+      ]
+    },
+    {
+      "registryType": "npm",
+      "identifier": "@arikusi/deepseek-mcp-server",
+      "version": "2.2.0",
+      "transport": {
+        "type": "streamable-http",
+        "url": "https://deepseek-mcp.tahirl.com/mcp"
+      },
+      "environmentVariables": [
+        {
+          "name": "DEEPSEEK_API_KEY",
+          "description": "DeepSeek API key (sent as Bearer token)",
+          "isRequired": true,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}

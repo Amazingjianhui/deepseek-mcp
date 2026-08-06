@@ -1,0 +1,429 @@
+# DeepSeek MCP Server - Complete Documentation
+
+A Model Context Protocol (MCP) server that integrates DeepSeek V4 models (deepseek-v4-flash and deepseek-v4-pro, 1M context) with MCP-compatible clients like Claude Code and Gemini CLI. deepseek-chat and deepseek-reasoner are deprecated aliases, still accepted and resolved to v4-flash. Hosted remote endpoint at deepseek-mcp.tahirl.com/mcp with BYOK (Bring Your Own Key) authentication. Also supports local stdio and self-hosted Streamable HTTP transports with Docker deployment. Provides multi-turn sessions, model fallback with circuit breaker, MCP Resources, chat completion, thinking mode, JSON output, function calling, multimodal content support, model-aware cost tracking, and 12 prompt templates.
+
+## Installation
+
+### Remote (No Install)
+
+```bash
+# Claude Code — connect to hosted endpoint with your own API key
+claude mcp add --transport http deepseek \
+  https://deepseek-mcp.tahirl.com/mcp \
+  --header "Authorization: Bearer YOUR_DEEPSEEK_API_KEY"
+```
+
+```json
+// Cursor / Windsurf / VS Code
+{
+  "mcpServers": {
+    "deepseek": {
+      "url": "https://deepseek-mcp.tahirl.com/mcp",
+      "headers": { "Authorization": "Bearer ${DEEPSEEK_API_KEY}" }
+    }
+  }
+}
+```
+
+### Local (stdio)
+
+```bash
+# Claude Code (all projects)
+claude mcp add -s user deepseek npx @arikusi/deepseek-mcp-server -e DEEPSEEK_API_KEY=your-key
+
+# Gemini CLI
+gemini mcp add deepseek npx @arikusi/deepseek-mcp-server -e DEEPSEEK_API_KEY=your-key
+
+# Global npm install
+npm install -g @arikusi/deepseek-mcp-server
+
+# Docker (build locally, bind to loopback with a token)
+docker build -t deepseek-mcp-server . && docker run -d -p 127.0.0.1:3000:3000 -e DEEPSEEK_API_KEY=your-key -e HTTP_AUTH_TOKEN=your-token deepseek-mcp-server
+```
+
+Get API key: https://platform.deepseek.com
+
+## Models
+
+deepseek-v4-flash and deepseek-v4-pro are the live V4 models (1M context, up to 384K output). deepseek-chat and deepseek-reasoner are deprecated compatibility aliases: still accepted and resolved to deepseek-v4-flash, but slated for removal in the next major release. The DeepSeek API itself retired those two names on 2026-07-24. All calls are non-thinking by default for fast responses; enable reasoning with thinking:{type:"enabled"}.
+
+### deepseek-v4-flash (default)
+- Fast, economical. General conversations, coding, content generation, agent loops
+- 1M context, up to 384K max output
+- Supports thinking mode, JSON mode, function calling
+- Pricing: $0.0028/1M cache hit, $0.14/1M cache miss, $0.28/1M output
+
+### deepseek-v4-pro
+- Most capable. Complex reasoning, math, hard multi-step tasks
+- 1M context, up to 384K max output
+- Supports thinking mode, JSON mode, function calling
+- Pricing: $0.003625/1M cache hit, $0.435/1M cache miss, $0.87/1M output
+
+### Model Routing Table
+
+| User selects | Sent to API | Thinking | reasoning_content |
+|---|---|---|---|
+| deepseek-v4-flash | deepseek-v4-flash | Off (default) | No |
+| deepseek-v4-flash + thinking:enabled | deepseek-v4-flash | On | Yes |
+| deepseek-v4-pro | deepseek-v4-pro | Off (default) | No |
+| deepseek-chat (deprecated alias) | deepseek-v4-flash | Off | No |
+| deepseek-reasoner (deprecated alias) | deepseek-v4-flash | On | Yes |
+
+## Tool: deepseek_chat
+
+### Input Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| messages | Array<{role, content, tool_call_id?}> | Yes | - | Conversation messages. Roles: system, user, assistant, tool. Content can be string or array of content parts (text/image_url) when multimodal is enabled |
+| model | "deepseek-v4-flash" \| "deepseek-v4-pro" \| "deepseek-chat" \| "deepseek-reasoner" | No | "deepseek-v4-flash" | Model to use (chat/reasoner are deprecated aliases for v4-flash, still accepted) |
+| temperature | number (0-2) | No | 1.0 | Sampling temperature. Ignored when thinking enabled |
+| max_tokens | number (1-384000) | No | model default | Max output tokens (V4 supports up to 384000; 1M context) |
+| stream | boolean | No | false | Enable streaming mode |
+| tools | Array<ToolDefinition> (max 128) | No | - | Function calling tool definitions |
+| tool_choice | "auto" \| "none" \| "required" \| {type, function} | No | "auto" | Which tool to call |
+| thinking | {type: "enabled" \| "disabled"} | No | disabled | Toggle thinking mode (non-thinking by default) |
+| reasoning_effort | "high" \| "max" | No | high | Reasoning effort while thinking is active |
+| json_mode | boolean | No | false | Enable JSON output mode (supported by both models) |
+| response_schema | object (JSON Schema) | No | - | Validate the model output against this JSON Schema. Implies JSON output. On mismatch, up to RESPONSE_SCHEMA_MAX_RETRIES repair retries feed the error back to the model. Schema regex patterns are ReDoS-screened; an unsafe pattern is rejected |
+| session_id | string | No | - | Session ID for multi-turn conversations |
+
+### Multi-Turn Sessions
+
+Use `session_id` to maintain conversation context across requests:
+
+```json
+// First request - creates session
+{
+  "messages": [{"role": "user", "content": "What is the capital of France?"}],
+  "session_id": "my-session"
+}
+
+// Second request - previous context is automatically prepended
+{
+  "messages": [{"role": "user", "content": "What about Germany?"}],
+  "session_id": "my-session"
+}
+```
+
+Sessions are stored in memory. In STDIO transport they live for the lifetime of the server process. In HTTP transport each MCP session gets its own isolated SessionStore, so session_id values are scoped to the MCP session that created them and are not visible to other connected HTTP clients. Sessions expire after SESSION_TTL_MINUTES (default: 30). Omit session_id for stateless single-turn requests.
+
+### Thinking Mode
+
+Enable thinking with the thinking parameter:
+
+```json
+{
+  "messages": [{"role": "user", "content": "Analyze quicksort complexity"}],
+  "model": "deepseek-v4-flash",
+  "thinking": {"type": "enabled"}
+}
+```
+
+The deprecated deepseek-reasoner alias produces the same result (it is routed as v4-flash + thinking). When thinking is active, temperature/top_p/frequency_penalty/presence_penalty are automatically ignored. The response includes a reasoning_content field with the chain-of-thought.
+
+### JSON Output Mode
+
+Get structured JSON responses:
+
+```json
+{
+  "messages": [{"role": "user", "content": "Return a json object with user data"}],
+  "model": "deepseek-v4-flash",
+  "json_mode": true
+}
+```
+
+Include the word "json" in your prompt for best results. Supported by both models. When JSON output is requested, the returned content is deterministically recovered as a clean JSON value even if the model wrapped it in a code fence or leaked chain-of-thought around it (no extra API call); if nothing parseable is found the raw text is preserved and json_parse_error is set.
+
+### Schema-Validated JSON
+
+Pass a response_schema (a JSON Schema) to constrain the output shape, not just its syntax:
+
+```json
+{
+  "messages": [{"role": "user", "content": "Classify this sentiment as json: \"loved it\""}],
+  "model": "deepseek-v4-flash",
+  "response_schema": {
+    "type": "object",
+    "properties": {
+      "sentiment": {"type": "string", "enum": ["positive", "negative", "neutral"]},
+      "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+    },
+    "required": ["sentiment", "confidence"],
+    "additionalProperties": false
+  }
+}
+```
+
+The server validates the parsed output with Ajv. On a mismatch it issues up to RESPONSE_SCHEMA_MAX_RETRIES repair retries (default 2, set 0 for a single deterministic call), feeding the validation error back to the model, and returns the first schema-valid object. A persistent mismatch surfaces as structuredContent.schema = {valid: false, attempts, error} rather than a silently coerced answer. Regex patterns in the schema are screened for catastrophic backtracking (ReDoS) before compilation; an unsafe pattern such as ^(a+)+$ is rejected up front as an invalid schema so it can never block the event loop.
+
+### Tool Definition Format
+
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "function_name",
+    "description": "What the function does",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "param1": { "type": "string", "description": "..." }
+      },
+      "required": ["param1"]
+    }
+  }
+}
+```
+
+### Response Format
+
+```json
+{
+  "content": "Response text",
+  "reasoning_content": "Chain-of-thought (thinking mode only)",
+  "model": "deepseek-v4-flash",
+  "usage": {
+    "prompt_tokens": 10,
+    "completion_tokens": 20,
+    "total_tokens": 30,
+    "prompt_cache_hit_tokens": 8,
+    "prompt_cache_miss_tokens": 2
+  },
+  "finish_reason": "stop",
+  "tool_calls": [
+    {
+      "id": "call_abc123",
+      "type": "function",
+      "function": { "name": "fn_name", "arguments": "{\"key\":\"value\"}" }
+    }
+  ],
+  "cost_usd": 0.000012,
+  "session_id": "my-session"
+}
+```
+
+## Tool: deepseek_fim
+
+Fill-in-the-Middle (FIM) completion for code and content infilling. Provide a prefix (`prompt`) and an optional `suffix`; the model completes the text between them. Runs on DeepSeek's Beta completions endpoint in non-thinking mode; output is capped at 4096 tokens. Same cache-aware cost tracking and model fallback (v4-flash <-> v4-pro) as deepseek_chat. The deprecated deepseek-chat / deepseek-reasoner aliases are still accepted and resolve to v4-flash (FIM has no thinking mode).
+
+Parameters: `prompt` (required), `suffix`, `model` (default deepseek-v4-flash), `max_tokens` (<= 4096), `temperature`, `stop` (string or array of up to 16).
+
+```json
+{
+  "prompt": "def fib(n):\n    if n < 2:\n        return n\n    return ",
+  "suffix": "\n\nprint(fib(10))",
+  "model": "deepseek-v4-flash",
+  "max_tokens": 64
+}
+```
+
+Response structuredContent: `text`, `model`, `usage`, `finish_reason`, `cost_usd` (and `routed_from` when an alias was used). Available on both the npm/stdio server and the hosted worker endpoint.
+
+## Tool: deepseek_sessions
+
+Manage conversation sessions:
+
+```json
+{"action": "list"}                                   // List all active sessions
+{"action": "delete", "session_id": "my-session"}     // Delete specific session
+{"action": "clear"}                                  // Clear all sessions
+```
+
+## MCP Resources
+
+Three read-only resources:
+
+| URI | Description |
+|-----|-------------|
+| deepseek://models | Model list with capabilities, context limits, pricing |
+| deepseek://config | Current server config (API key masked: sk-****1234) |
+| deepseek://usage | Real-time usage stats (requests, tokens, costs, sessions, cache ratio) |
+
+## Model Fallback & Circuit Breaker
+
+**Fallback**: On retryable errors (429, 503, timeout), automatically tries the other model:
+- deepseek-v4-flash fails → tries deepseek-v4-pro
+- deepseek-v4-pro fails → tries deepseek-v4-flash
+- The deprecated aliases (which resolve to v4-flash) fall back to deepseek-v4-pro
+- Response includes fallback info when fallback was used
+
+**Circuit Breaker**: Protects against cascading failures:
+- CLOSED → normal operation
+- After CIRCUIT_BREAKER_THRESHOLD failures (default 5) → OPEN (fast-fail for CIRCUIT_BREAKER_RESET_TIMEOUT ms)
+- After timeout → HALF_OPEN (probe with 1 request)
+- Probe succeeds → CLOSED; Probe fails → OPEN again
+
+Disable with FALLBACK_ENABLED=false.
+
+## Function Calling Flow
+
+1. Send messages with `tools` array defining available functions
+2. Model responds with `tool_calls` containing function name and arguments
+3. Execute the function locally
+4. Send result back as a `tool` role message with `tool_call_id`
+5. Model generates final response using the tool result
+
+## Cost Tracking
+
+V4 provides cache-aware pricing. Cost display shows:
+- Total cost in USD
+- Cache hit ratio (percentage of prompt tokens served from cache)
+- Estimated savings from cache hits
+
+Example output: `$0.0042 (cache hit: 80%, saved ~$0.0168)`
+
+## Configuration (Environment Variables)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| DEEPSEEK_API_KEY | (required) | DeepSeek API key |
+| DEEPSEEK_BASE_URL | https://api.deepseek.com | Custom API endpoint |
+| DEFAULT_MODEL | deepseek-v4-flash | Default model for requests |
+| SHOW_COST_INFO | true | Show cost info in responses |
+| REQUEST_TIMEOUT | 60000 | Request timeout (ms) |
+| MAX_RETRIES | 2 | Max retry count |
+| SKIP_CONNECTION_TEST | false | Skip startup API connection test |
+| MAX_MESSAGE_LENGTH | 100000 | Max message content length (chars) |
+| SESSION_TTL_MINUTES | 30 | Session time-to-live in minutes |
+| MAX_SESSIONS | 100 | Maximum concurrent sessions |
+| FALLBACK_ENABLED | true | Enable automatic model fallback |
+| CIRCUIT_BREAKER_THRESHOLD | 5 | Consecutive failures before circuit opens |
+| CIRCUIT_BREAKER_RESET_TIMEOUT | 30000 | Milliseconds before circuit half-opens |
+| MAX_SESSION_MESSAGES | 200 | Max messages per session (sliding window) |
+| RESPONSE_SCHEMA_MAX_RETRIES | 2 | Repair retries when a response_schema validation fails (0 disables) |
+
+## Prompt Templates (12 total)
+
+### Core Reasoning
+- debug_with_reasoning(code, error?, language?)
+- code_review_deep(code, language?, focus: security|performance|quality|all)
+- research_synthesis(topic, context?, depth: brief|moderate|comprehensive)
+- strategic_planning(goal, context?, constraints?)
+- explain_like_im_five(topic, audience: child|beginner|intermediate)
+
+### Advanced
+- mathematical_proof(statement, context?)
+- argument_validation(argument, type: informal|formal|both)
+- creative_ideation(challenge, constraints?, quantity: 1-20)
+- cost_comparison(task, estimated_tokens)
+- pair_programming(task, language, style: beginner|intermediate|expert)
+
+### Function Calling
+- function_call_debug(tools_json, messages_json, error?)
+- create_function_schema(description, examples?)
+
+## Remote Endpoint (Hosted)
+
+A hosted BYOK endpoint is available at: https://deepseek-mcp.tahirl.com/mcp
+
+Send your DeepSeek API key as `Authorization: Bearer <key>`. No server-side key stored. Powered by Cloudflare Workers (global edge, zero cold start, free tier).
+
+Endpoints:
+- `GET /health` — health check (status, version, transport, timestamp)
+- `GET /` — server info (name, version, description, endpoints)
+- `POST /mcp` — MCP JSON-RPC requests (requires Bearer auth)
+
+## HTTP Transport (Self-Hosted)
+
+Run your own HTTP server instead of stdio:
+
+```bash
+TRANSPORT=http HTTP_PORT=3000 DEEPSEEK_API_KEY=your-key node dist/index.js
+```
+
+Endpoints:
+- `GET /health` — health check (status, version, uptime), always open
+- `POST /mcp` — MCP JSON-RPC requests (Streamable HTTP protocol)
+- `GET /mcp` — SSE stream (requires Mcp-Session-Id header)
+- `DELETE /mcp` — terminate session
+
+Security (1.8.0+): in HTTP mode the server holds DEEPSEEK_API_KEY and spends it on every deepseek_chat call, so the endpoint must not sit open on a public interface. HTTP_HOST defaults to 127.0.0.1, so a plain run only listens on loopback with DNS rebinding protection active. To accept remote connections set HTTP_HOST=0.0.0.0 and set HTTP_AUTH_TOKEN, which makes /mcp require `Authorization: Bearer <token>` (/health stays open). Binding to 0.0.0.0 without a token prints a startup warning. Use HTTP_ALLOWED_HOSTS to keep host-header validation when binding to all interfaces, and front internet-facing deployments with an authenticating TLS reverse proxy.
+
+Each MCP session gets its own McpServer instance AND its own SessionStore instance (session-store isolation added in 1.7.0 to prevent cross-session data exposure). DeepSeekClient is shared across sessions since it is a stateless API client.
+
+## Docker
+
+```bash
+docker build -t deepseek-mcp-server .
+# Reachable from the host's loopback only, with a bearer token
+docker run -d -p 127.0.0.1:3000:3000 -e DEEPSEEK_API_KEY=your-key -e HTTP_AUTH_TOKEN=your-token deepseek-mcp-server
+```
+
+Docker defaults to HTTP transport and binds 0.0.0.0 inside the container (required for the port mapping). Control exposure at the publish layer: the bundled docker-compose.yml publishes to 127.0.0.1 only. Set HTTP_AUTH_TOKEN if you publish the port on a public interface. Health check is built in (wget to /health every 30s).
+
+## Architecture
+
+```
+src/
+  index.ts              # Entry point, bootstrap
+  server.ts             # McpServer factory (version from package.json)
+  deepseek-client.ts    # DeepSeek API wrapper (circuit breaker + fallback)
+  config.ts             # Zod-validated config from env vars
+  cost.ts               # V4 cache-aware cost calculation
+  schemas.ts            # Zod input validation schemas
+  types.ts              # TypeScript types + type guards
+  errors.ts             # Custom error classes
+  session.ts            # In-memory session store
+  circuit-breaker.ts    # Circuit breaker pattern
+  usage-tracker.ts      # Usage statistics tracker
+  transport-http.ts     # Streamable HTTP transport (Express)
+  tools/
+    deepseek-chat.ts    # deepseek_chat tool (sessions + fallback)
+    deepseek-fim.ts     # deepseek_fim tool (fill-in-the-middle)
+    deepseek-sessions.ts # deepseek_sessions tool
+    index.ts            # Tool registration aggregator
+  resources/
+    models.ts           # deepseek://models resource
+    config.ts           # deepseek://config resource
+    usage.ts            # deepseek://usage resource
+    index.ts            # Resource registration aggregator
+  prompts/
+    core.ts             # 5 core reasoning prompts
+    advanced.ts         # 5 advanced prompts
+    function-calling.ts # 2 function calling prompts
+    index.ts            # Prompt registration aggregator
+```
+
+## Configuration (Environment Variables)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| DEEPSEEK_API_KEY | (required) | DeepSeek API key |
+| DEEPSEEK_BASE_URL | https://api.deepseek.com | Custom API endpoint |
+| DEFAULT_MODEL | deepseek-v4-flash | Default model for requests |
+| SHOW_COST_INFO | true | Show cost info in responses |
+| REQUEST_TIMEOUT | 60000 | Request timeout (ms) |
+| MAX_RETRIES | 2 | Max retry count |
+| SKIP_CONNECTION_TEST | false | Skip startup API connection test |
+| MAX_MESSAGE_LENGTH | 100000 | Max message content length (chars) |
+| SESSION_TTL_MINUTES | 30 | Session time-to-live in minutes |
+| MAX_SESSIONS | 100 | Maximum concurrent sessions |
+| FALLBACK_ENABLED | true | Enable automatic model fallback |
+| CIRCUIT_BREAKER_THRESHOLD | 5 | Consecutive failures before circuit opens |
+| CIRCUIT_BREAKER_RESET_TIMEOUT | 30000 | Milliseconds before circuit half-opens |
+| MAX_SESSION_MESSAGES | 200 | Max messages per session (sliding window) |
+| RESPONSE_SCHEMA_MAX_RETRIES | 2 | Repair retries when a response_schema validation fails (0 disables) |
+| ENABLE_MULTIMODAL | false | Enable multimodal (image) input support |
+| TRANSPORT | stdio | Transport mode: stdio or http |
+| HTTP_PORT | 3000 | HTTP server port (when TRANSPORT=http) |
+| HTTP_HOST | 127.0.0.1 | Bind address for HTTP transport. Loopback by default; set to 0.0.0.0 for remote access (pair with auth) |
+| HTTP_AUTH_TOKEN | (unset) | When set, /mcp requires `Authorization: Bearer <token>`. /health stays open |
+| HTTP_ALLOWED_HOSTS | (unset) | Comma-separated allowed Host headers for DNS rebinding protection when binding to 0.0.0.0 |
+
+## Tech Stack
+
+- TypeScript 6.0 (strict mode)
+- @modelcontextprotocol/sdk for MCP protocol
+- OpenAI SDK v6 for API compatibility
+- Zod v4 for validation
+- Vitest for testing (280 tests, ~89% line coverage)
+- Node.js 20+
+
+## Links
+
+- npm: https://www.npmjs.com/package/@arikusi/deepseek-mcp-server
+- GitHub: https://github.com/arikusi/deepseek-mcp-server
+- DeepSeek API: https://api-docs.deepseek.com
+- MCP Spec: https://modelcontextprotocol.io

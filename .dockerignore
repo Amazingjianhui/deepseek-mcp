@@ -1,0 +1,16 @@
+node_modules
+dist
+.git
+.github
+.smithery
+.claude
+coverage
+.env
+.env.local
+*.test.ts
+*.spec.ts
+vitest.config.ts
+PROJECT_CONTEXT.md
+IMPROVEMENT_ROADMAP.md
+NOTES.md
+worker
